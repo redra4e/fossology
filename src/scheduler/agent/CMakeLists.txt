@@ -62,6 +62,7 @@ foreach(FO_SCH_TARGET scheduler fo_scheduler scheduler_cov)
             ${FO_CWD}/event.c
             ${FO_CWD}/agent.c
             ${FO_CWD}/host.c
+            ${FO_CWD}/proxy.c
             ${FO_CWD}/database.c
             ${FO_CWD}/job.c
             ${FO_CWD}/logging.c

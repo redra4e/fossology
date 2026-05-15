@@ -19,6 +19,7 @@
 #include <host.h>
 #include <job.h>
 #include <logging.h>
+#include <proxy.h>
 #include <scheduler.h>
 
 /* library includes */
@@ -106,8 +107,10 @@
 
 /** Send logging specifically to the agent log file */
 #define AGENT_CONCURRENT_PRINT(...) do {                             \
-  AGENT_LOG_CREDENTIAL;                                 \
-  con_printf(job_log(agent->owner), __VA_ARGS__); } while(0)
+  if(agent && agent->owner) {                                        \
+    AGENT_LOG_CREDENTIAL;                                            \
+    con_printf(job_log(agent->owner), __VA_ARGS__);                  \
+  } } while(0)
 
 /* ************************************************************************** */
 /* **** Data Types ********************************************************** */
@@ -263,6 +266,12 @@ static int agent_test(const gchar* name, meta_agent_t* ma, scheduler_t* schedule
   for (iter = scheduler->host_queue; iter != NULL; iter = iter->next)
   {
     host = (host_t*) iter->data;
+    /* Skip proxy-managed hosts during startup testing — the proxy
+     * command routes to remote nodes that may not be reachable yet
+     * and spawning dozens of test agents over SSH causes cascading
+     * failures and thread races. */
+    if (host->proxy_managed)
+      continue;
     V_AGENT("META_AGENT[%s] testing on HOST[%s]\n", ma->name, host->name);
     job_t* job = job_init(scheduler->job_list, scheduler->job_queue, ma->name, host->name, id_gen--, 0, 0, 0, 0, jq_cmd_args);
     agent_init(scheduler, host, job);
@@ -317,7 +326,7 @@ static void agent_listen(scheduler_t* scheduler, agent_t* agent)
   {
     if (strncmp(buffer, "@@@1", 4) == 0)
     {
-      THREAD_FATAL(job_log(agent->owner), "agent crashed before sending version information");
+      THREAD_FATAL(agent->owner ? job_log(agent->owner) : main_log, "agent crashed before sending version information");
     }
     else
     {
@@ -346,12 +355,13 @@ static void agent_listen(scheduler_t* scheduler, agent_t* agent)
       con_printf(main_log, "META_AGENT[%s.%s] version is: \"%s\"\n", agent->host->name, agent->type->name,
           agent->type->version);
   }
-  else if (strcmp(agent->type->version, buffer) != 0)
+  else if (agent->type->version != NULL && strcmp(agent->type->version, buffer) != 0)
   {
-    con_printf(job_log(agent->owner), "ERROR %s.%d: META_DATA[%s] invalid agent spawn check\n", __FILE__, __LINE__,
+    { log_t* _jlog = agent->owner ? job_log(agent->owner) : main_log;
+    con_printf(_jlog, "ERROR %s.%d: META_DATA[%s] invalid agent spawn check\n", __FILE__, __LINE__,
         agent->type->name);
-    con_printf(job_log(agent->owner), "ERROR: versions don't match: %s(%s) != received: %s(%s)\n",
-        agent->type->version_source, agent->type->version, agent->host->name, buffer);
+    con_printf(_jlog, "ERROR: versions don't match: %s(%s) != received: %s(%s)\n",
+        agent->type->version_source, agent->type->version, agent->host->name, buffer); }
     agent->type->valid = 0;
     agent_kill(agent);
 #if GLIB_MAJOR_VERSION >= 2 && GLIB_MINOR_VERSION >= 32
@@ -470,7 +480,8 @@ static void agent_listen(scheduler_t* scheduler, agent_t* agent)
       g_match_info_free(match);
       match = NULL;
 
-      database_job_processed(agent->owner->id, agent->total_analyzed);
+      if (agent->owner != NULL)
+        database_job_processed(agent->owner->id, agent->total_analyzed);
     }
 
     /*! - \b command: "EMAIL"
@@ -481,7 +492,8 @@ static void agent_listen(scheduler_t* scheduler, agent_t* agent)
      */
     else if (strncmp(buffer, "EMAIL", 5) == 0)
     {
-      agent->owner->message = g_strdup(buffer + 6);
+      if (agent->owner != NULL)
+        agent->owner->message = g_strdup(buffer + 6);
     }
 
     /*! - \b command: "SPECIAL"
@@ -746,6 +758,52 @@ static void* agent_spawn(agent_spawn_args* pass)
     /* if the agent is started using ssh we don't need */
     /* to fully parse the arguments, just pass the run */
     /* command as the last argument to the ssh command */
+    else if (agent->host->proxy_managed &&
+             proxy_is_enabled(scheduler->proxy) &&
+             scheduler->proxy->command != NULL)
+    {
+      /* Proxy-managed host: route through the proxy command.
+       * The proxy command receives the target host, agent type, and the
+       * full agent binary command so it can route to the correct node
+       * (via SSH jump-host, kubectl exec, docker exec, etc.).
+       * Note: raw_cmd already includes --scheduler_start (appended by
+       * meta_agent_init), so we must not add it again here. */
+      len = snprintf(buffer, sizeof(buffer), AGENT_BINARY " --userID=%d --groupID=%d --jobId=%d",
+                     agent->host->agent_dir, AGENT_CONF, agent->type->name, agent->type->raw_cmd,
+                     agent->owner->user_id, agent->owner->group_id, agent->owner->parent_id);
+
+      if (len >= sizeof(buffer)) {
+        *(buffer + sizeof(buffer) - 1) = '\0';
+        log_printf("ERROR %s.%d: JOB[%d.%s]: exec failed: truncated buffer: \"%s\"",
+            __FILE__, __LINE__, agent->owner->id, agent->owner->agent_type, buffer);
+        exit(5);
+      }
+
+      {
+        int ai = 0;
+        char port_str[8];
+        args = g_new0(char*, 13);
+        args[ai++] = scheduler->proxy->command;
+        args[ai++] = "--target";
+        args[ai++] = agent->host->address;
+        args[ai++] = "--agent-type";
+        args[ai++] = agent->type->name;
+        if (scheduler->proxy->address != NULL) {
+          args[ai++] = "--proxy-address";
+          args[ai++] = scheduler->proxy->address;
+        }
+        if (scheduler->proxy->port != 0) {
+          snprintf(port_str, sizeof(port_str), "%d", scheduler->proxy->port);
+          args[ai++] = "--proxy-port";
+          args[ai++] = port_str;
+        }
+        args[ai++] = "--";
+        args[ai++] = buffer;
+        args[ai++] = agent->owner->jq_cmd_args;
+        args[ai]   = NULL;
+        execv(args[0], args);
+      }
+    }
     else
     {
       args = g_new0(char*, 5);
@@ -1022,6 +1080,17 @@ void agent_death_event(scheduler_t* scheduler, pid_t* pid)
     return;
   }
 
+  if (agent->owner == NULL)
+  {
+    ERROR("agent death event for pid[%d] but agent has no owner (job already removed)", pid[0]);
+    if (write(agent->to_parent, "@@@1\n", 5) != 5)
+      AGENT_SEQUENTIAL_PRINT("write to agent unsuccessful: %s\n", strerror(errno));
+    g_thread_join(agent->thread);
+    g_tree_remove(scheduler->agents, &agent->pid);
+    g_free(pid);
+    return;
+  }
+
   if (agent->owner->id >= 0)
     event_signal(database_update_event, NULL);
 
@@ -1174,6 +1243,8 @@ void agent_fail_event(scheduler_t* scheduler, agent_t* agent)
 {
   TEST_NULV(agent);
   agent_transition(agent, AG_FAILED);
+  if (agent->owner == NULL)
+    return;
   job_fail_agent(agent->owner, agent);
   if (write(agent->to_parent, "@@@1\n", 5) != 5)
     AGENT_ERROR("Failed to kill agent thread cleanly");
@@ -1209,7 +1280,7 @@ void agent_transition(agent_t* agent, agent_status new_status)
   AGENT_SEQUENTIAL_PRINT("agent status change: %s -> %s\n", agent_status_strings[agent->status],
       agent_status_strings[new_status]);
 
-  if (agent->owner->id > 0)
+  if (agent->owner != NULL && agent->owner->id > 0)
   {
     if (agent->status == AG_PAUSED)
     {
@@ -1293,8 +1364,11 @@ void agent_print_status(agent_t* agent, GOutputStream* ostr)
  */
 void agent_kill(agent_t* agent)
 {
+  if (agent == NULL)
+    return;
   AGENT_SEQUENTIAL_PRINT("KILL: sending SIGKILL to pid %d\n", agent->pid);
-  meta_agent_decrease_count(agent->type);
+  if (agent->type != NULL)
+    meta_agent_decrease_count(agent->type);
   kill(agent->pid, SIGKILL);
 }
 

@@ -102,6 +102,9 @@
 /* local includes */
 #include <logging.h>
 
+/* forward declaration for proxy type */
+struct proxy_s;
+
 /* std library includes */
 #include <errno.h>
 #include <limits.h>
@@ -159,6 +162,9 @@ typedef struct
     /* used exclusively in host.c */
     GTree* host_list;       ///< List of all hosts available to the scheduler
     GList* host_queue;      ///< Round-robin queue for choosing which host use next
+
+    /* used exclusively in proxy.c */
+    struct proxy_s* proxy;  ///< Centralized proxy configuration for multi-node routing
 
     /* used exclusively in interface.c */
     gboolean      i_created;    ///< Has the interface been created

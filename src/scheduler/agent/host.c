@@ -142,8 +142,21 @@ void host_print(host_t* host, GOutputStream* ostr)
 {
   char* buf;
 
-  buf = g_strdup_printf("host:%s address:%s max:%d running:%d\n",
-      host->name, host->address, host->max, host->running);
+  if (host->n_tags > 0) {
+    GString* tag_str = g_string_new(NULL);
+    for (int i = 0; i < host->n_tags; i++) {
+      if (i > 0) g_string_append_c(tag_str, ' ');
+      g_string_append(tag_str, host->tags[i]);
+    }
+    buf = g_strdup_printf("host:%s address:%s max:%d running:%d tags:[%s] proxy:%s\n",
+        host->name, host->address, host->max, host->running, tag_str->str,
+        host->proxy_managed ? "yes" : "no");
+    g_string_free(tag_str, TRUE);
+  } else {
+    buf = g_strdup_printf("host:%s address:%s max:%d running:%d tags:[*] proxy:%s\n",
+        host->name, host->address, host->max, host->running,
+        host->proxy_managed ? "yes" : "no");
+  }
   g_output_stream_write(ostr, buf, strlen(buf), NULL, NULL);
 
   g_free(buf);
@@ -166,7 +179,7 @@ host_t* get_host(GList** queue, uint8_t num)
   for(curr = host_queue; curr != NULL; curr = curr->next)
   {
     ret = curr->data;
-    if(ret->max - ret->running >= num)
+    if(ret->running < ret->max && (ret->max - ret->running) >= num)
       break;
   }
 
@@ -205,8 +218,11 @@ void print_host_load(GTree* host_list, GOutputStream* ostr)
  */
 static gboolean host_accepts_agent(const host_t* host, const char* agent_type)
 {
+  if (host == NULL || agent_type == NULL)
+    return FALSE;
+
   if (host->n_tags == 0)
-    return TRUE;  /* no tags → accepts everything (backward compat) */
+    return TRUE;
 
   for (int i = 0; i < host->n_tags; i++) {
     if (strcmp(host->tags[i], agent_type) == 0)
@@ -218,9 +234,11 @@ static gboolean host_accepts_agent(const host_t* host, const char* agent_type)
 /**
  * @brief Select a host that can run the given agent type.
  *
- * Iterates the round-robin queue and returns the first host that has at least
- * @p num free agent slots and is tagged for @p agent_type (or has no tags,
- * i.e. is a universal host that accepts any agent type).
+ * Uses a two-pass algorithm to prefer specialized (tagged) hosts over universal
+ * (untagged) ones.  Pass 1 looks for a host that is explicitly tagged for
+ * @p agent_type and has capacity.  Pass 2 falls back to any universal host
+ * (n_tags == 0) with capacity.  This ensures that specialized nodes handle
+ * their designated agent types first, and universal nodes only pick up overflow.
  *
  * The selected host is moved to the tail of the queue to implement round-robin
  * scheduling within the eligible set.
@@ -235,10 +253,28 @@ host_t* get_host_for(scheduler_t* scheduler, const char* agent_type, uint8_t num
   GList*  curr = NULL;
   host_t* host = NULL;
 
+  if (scheduler == NULL || agent_type == NULL)
+    return NULL;
+
+  /* Pass 1: prefer hosts explicitly tagged for this agent type */
   for (curr = scheduler->host_queue; curr != NULL; curr = curr->next) {
     host = curr->data;
-    if (host->max - host->running >= num && host_accepts_agent(host, agent_type))
+    if (host->n_tags > 0 &&
+        host->running < host->max &&
+        (host->max - host->running) >= num &&
+        host_accepts_agent(host, agent_type))
       break;
+  }
+
+  /* Pass 2: fall back to universal (untagged) hosts */
+  if (curr == NULL) {
+    for (curr = scheduler->host_queue; curr != NULL; curr = curr->next) {
+      host = curr->data;
+      if (host->n_tags == 0 &&
+          host->running < host->max &&
+          (host->max - host->running) >= num)
+        break;
+    }
   }
 
   if (curr == NULL)

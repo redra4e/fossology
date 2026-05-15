@@ -15,6 +15,7 @@
 #include <interface.h>
 #include <job.h>
 #include <logging.h>
+#include <proxy.h>
 #include <scheduler.h>
 
 /* std library includes */
@@ -38,9 +39,6 @@
 #define BUFFER_SIZE 1024
 
 #define netw g_output_stream_write
-
-#define PROXY_PROTOCOL     "socks5"
-#define PROXY_DEFAULT_PORT 1080
 
 /* ************************************************************************** */
 /* **** Data Types ********************************************************** */
@@ -458,6 +456,16 @@ void interface_thread(interface_connection* conn, scheduler_t* scheduler)
     else if(strcmp(cmd, "database") == 0)
     {
       event_signal(database_update_event, NULL);
+    }
+
+    /* command: "proxy"
+     *
+     * The interface has requested information about the proxy configuration.
+     * Respond with the current proxy status (enabled/disabled, command, etc.).
+     */
+    else if(strcmp(cmd, "proxy") == 0)
+    {
+      proxy_print_status(scheduler->proxy, conn->ostr);
     }
 
     /* command: unknown

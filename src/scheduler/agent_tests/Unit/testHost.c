@@ -242,19 +242,211 @@ void test_get_host_for_affinity()
   scheduler_destroy(scheduler);
 }
 
+/**
+ * \brief All hosts tagged, none match the requested agent type
+ * \test
+ * -# Insert two tagged hosts (nomos-only and monk-only)
+ * -# Request "copyright" → should return NULL
+ */
+void test_get_host_for_no_match()
+{
+  scheduler_t* scheduler;
+  host_t* result;
+  const char* tags_a[] = {"nomos"};
+  const char* tags_b[] = {"monk"};
+
+  scheduler = scheduler_init(testdb, NULL);
+  host_insert(host_init("h1", "h1.local", "/dir", 4, (char**)tags_a, 1), scheduler);
+  host_insert(host_init("h2", "h2.local", "/dir", 4, (char**)tags_b, 1), scheduler);
+
+  result = get_host_for(scheduler, "copyright", 1);
+  FO_ASSERT_PTR_NULL(result);
+
+  scheduler_destroy(scheduler);
+}
+
+/**
+ * \brief Tagged host at capacity falls back to untagged host
+ * \test
+ * -# Insert a tagged host at max capacity and an untagged host
+ * -# Request the tagged agent type → should return the untagged fallback
+ */
+void test_get_host_for_capacity_fallback()
+{
+  scheduler_t* scheduler;
+  host_t* tagged;
+  host_t* result;
+  const char* tags[] = {"nomos"};
+
+  scheduler = scheduler_init(testdb, NULL);
+  tagged = host_init("tagged", "t.local", "/dir", 2, (char**)tags, 1);
+  tagged->running = 2;
+  host_insert(tagged, scheduler);
+  host_insert(host_init("untagged", "u.local", "/dir", 4, NULL, 0), scheduler);
+
+  result = get_host_for(scheduler, "nomos", 1);
+  FO_ASSERT_PTR_NOT_NULL(result);
+  FO_ASSERT_STRING_EQUAL(result->name, "untagged");
+
+  scheduler_destroy(scheduler);
+}
+
+/**
+ * \brief Round-robin rotation works with affinity filtering
+ * \test
+ * -# Insert two untagged hosts
+ * -# Successive get_host_for calls should alternate between them
+ */
+void test_get_host_for_round_robin()
+{
+  scheduler_t* scheduler;
+  host_t* r1;
+  host_t* r2;
+
+  scheduler = scheduler_init(testdb, NULL);
+  host_insert(host_init("a", "a.local", "/dir", 4, NULL, 0), scheduler);
+  host_insert(host_init("b", "b.local", "/dir", 4, NULL, 0), scheduler);
+
+  r1 = get_host_for(scheduler, "nomos", 1);
+  FO_ASSERT_STRING_EQUAL(r1->name, "a");
+  r2 = get_host_for(scheduler, "nomos", 1);
+  FO_ASSERT_STRING_EQUAL(r2->name, "b");
+  r1 = get_host_for(scheduler, "nomos", 1);
+  FO_ASSERT_STRING_EQUAL(r1->name, "a");
+
+  scheduler_destroy(scheduler);
+}
+
+/**
+ * \brief NULL arguments return NULL without crashing
+ * \test
+ * -# get_host_for(NULL, ...) → NULL
+ * -# get_host_for(scheduler, NULL, ...) → NULL
+ */
+void test_get_host_for_null_args()
+{
+  scheduler_t* scheduler;
+  host_t* result;
+
+  scheduler = scheduler_init(testdb, NULL);
+  host_insert(host_init("h1", "h1.local", "/dir", 4, NULL, 0), scheduler);
+
+  result = get_host_for(NULL, "nomos", 1);
+  FO_ASSERT_PTR_NULL(result);
+  result = get_host_for(scheduler, NULL, 1);
+  FO_ASSERT_PTR_NULL(result);
+
+  scheduler_destroy(scheduler);
+}
+
+/**
+ * \brief Verify proxy_managed flag defaults to FALSE
+ * \test
+ * -# Create a host with host_init (no proxy flag)
+ * -# proxy_managed should be FALSE
+ */
+void test_host_proxy_default()
+{
+  host_t* host;
+  host = host_init("h1", "h1.local", "/dir", 4, NULL, 0);
+  FO_ASSERT_FALSE(host->proxy_managed);
+  host_destroy(host);
+}
+
+/**
+ * \brief Verify proxy_managed flag can be set on a host
+ * \test
+ * -# Create a host and set proxy_managed = TRUE
+ * -# Verify the flag is set correctly
+ */
+void test_host_proxy_managed()
+{
+  host_t* host;
+  host = host_init("proxy-h", "proxy.local", "/dir", 8, NULL, 0);
+  host->proxy_managed = TRUE;
+  FO_ASSERT_TRUE(host->proxy_managed);
+  host_destroy(host);
+}
+
+/**
+ * \brief Proxy-managed host with tags still participates in affinity routing
+ * \test
+ * -# Insert a proxy-managed tagged host and a direct untagged host
+ * -# Request the tagged agent type → should return the proxy-managed host
+ */
+void test_get_host_for_proxy_with_tags()
+{
+  scheduler_t* scheduler;
+  host_t* tagged;
+  host_t* result;
+  const char* tags[] = {"nomos"};
+
+  scheduler = scheduler_init(testdb, NULL);
+  tagged = host_init("proxy-heavy", "heavy.local", "/dir", 8, (char**)tags, 1);
+  tagged->proxy_managed = TRUE;
+  host_insert(tagged, scheduler);
+  host_insert(host_init("direct", "direct.local", "/dir", 4, NULL, 0), scheduler);
+
+  /* "nomos" should route to the tagged proxy host first */
+  result = get_host_for(scheduler, "nomos", 1);
+  FO_ASSERT_PTR_NOT_NULL(result);
+  FO_ASSERT_STRING_EQUAL(result->name, "proxy-heavy");
+  FO_ASSERT_TRUE(result->proxy_managed);
+
+  scheduler_destroy(scheduler);
+}
+
+/**
+ * \brief Tagged host is preferred over universal host for matching agent type
+ * \test
+ * -# Insert a universal host first, then a tagged host (nomos)
+ * -# Request "nomos" → should return the tagged host, not the universal one
+ * -# Request "copyright" → should return the universal host (no tagged match)
+ */
+void test_get_host_for_prefers_tagged()
+{
+  scheduler_t* scheduler;
+  host_t* result;
+  const char* tags[] = {"nomos"};
+
+  scheduler = scheduler_init(testdb, NULL);
+
+  /* Universal host is inserted first — without two-pass it would win */
+  host_insert(host_init("universal", "u.local", "/dir", 4, NULL, 0), scheduler);
+  host_insert(host_init("nomos-box", "n.local", "/dir", 4, (char**)tags, 1), scheduler);
+
+  result = get_host_for(scheduler, "nomos", 1);
+  FO_ASSERT_PTR_NOT_NULL(result);
+  FO_ASSERT_STRING_EQUAL(result->name, "nomos-box");
+
+  result = get_host_for(scheduler, "copyright", 1);
+  FO_ASSERT_PTR_NOT_NULL(result);
+  FO_ASSERT_STRING_EQUAL(result->name, "universal");
+
+  scheduler_destroy(scheduler);
+}
+
 /* ************************************************************************** */
 /* *** suite declaration **************************************************** */
 /* ************************************************************************** */
 
 CU_TestInfo tests_host[] =
 {
-    {"Test host_init",                 test_host_init                },
-    {"Test host_insert",               test_host_insert              },
-    {"Test host_increase_load",        test_host_increase_load       },
-    {"Test host_decrease_load",        test_host_decrease_load       },
-    {"Test host_get_host",             test_get_host                 },
-    {"Test host_init_with_tags",       test_host_init_with_tags      },
-    {"Test get_host_for_affinity",     test_get_host_for_affinity    },
+    {"Test host_init",                      test_host_init                     },
+    {"Test host_insert",                    test_host_insert                   },
+    {"Test host_increase_load",             test_host_increase_load            },
+    {"Test host_decrease_load",             test_host_decrease_load            },
+    {"Test host_get_host",                  test_get_host                      },
+    {"Test host_init_with_tags",            test_host_init_with_tags           },
+    {"Test get_host_for_affinity",          test_get_host_for_affinity         },
+    {"Test get_host_for_no_match",          test_get_host_for_no_match         },
+    {"Test get_host_for_capacity_fallback", test_get_host_for_capacity_fallback},
+    {"Test get_host_for_round_robin",       test_get_host_for_round_robin      },
+    {"Test get_host_for_null_args",         test_get_host_for_null_args        },
+    {"Test host_proxy_default",             test_host_proxy_default            },
+    {"Test host_proxy_managed",             test_host_proxy_managed            },
+    {"Test get_host_for_proxy_with_tags",   test_get_host_for_proxy_with_tags  },
+    {"Test get_host_for_prefers_tagged",   test_get_host_for_prefers_tagged   },
     CU_TEST_INFO_NULL
 };
 

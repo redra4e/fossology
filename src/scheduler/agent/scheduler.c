@@ -15,6 +15,7 @@
 #include <event.h>
 #include <host.h>
 #include <interface.h>
+#include <proxy.h>
 #include <scheduler.h>
 #include <fossconfig.h>
 
@@ -343,6 +344,8 @@ scheduler_t* scheduler_init(gchar* sysconfigdir, log_t* log)
   ret->job_list     = g_tree_new_full(int_compare, NULL, NULL,
       (GDestroyNotify)job_destroy);
 
+  ret->proxy = proxy_init();
+
   main_log = log;
 
   return ret;
@@ -391,6 +394,9 @@ void scheduler_destroy(scheduler_t* scheduler)
   g_tree_unref(scheduler->job_list);
 
   if (scheduler->db_conn) PQfinish(scheduler->db_conn);
+
+  proxy_destroy(scheduler->proxy);
+  scheduler->proxy = NULL;
 
   g_free(scheduler);
 }
@@ -460,8 +466,17 @@ void scheduler_update(scheduler_t* scheduler)
 
   if(job == NULL && !lockout)
   {
-    while((job = peek_job(scheduler->job_queue)) != NULL)
+    /* Iterate through the job queue, dispatching jobs that can find a host.
+     * Jobs that cannot be dispatched (no host capacity) are skipped rather
+     * than blocking subsequent jobs — this prevents head-of-line blocking
+     * in multi-node deployments where different agent types route to
+     * different hosts. */
+    GSequenceIter* iter = g_sequence_get_begin_iter(scheduler->job_queue);
+    while(!g_sequence_iter_is_end(iter))
     {
+      job = g_sequence_get(iter);
+      host = NULL;
+
       // Check the max limit of running agents
       if (isMaxLimitReached(
           g_tree_lookup(scheduler->meta_agents, job->agent_type)))
@@ -469,7 +484,8 @@ void scheduler_update(scheduler_t* scheduler)
         V_SCHED("JOB_INIT: Unable to run agent %s due to max_run limit.\n",
             job->agent_type);
         job = NULL;
-        break;
+        iter = g_sequence_iter_next(iter);
+        continue;
       }
       // check if the agent is required to run on local host
       if(is_meta_special(
@@ -479,7 +495,8 @@ void scheduler_update(scheduler_t* scheduler)
         if(!(host->running < host->max))
         {
           job = NULL;
-          break;
+          iter = g_sequence_iter_next(iter);
+          continue;
         }
       }
       // check if the job is required to run on a specific machine
@@ -490,26 +507,33 @@ void scheduler_update(scheduler_t* scheduler)
         {
           if(!(host->running < host->max))
           {
+            job = NULL;
+            iter = g_sequence_iter_next(iter);
+            continue;
+          }
+        } else {
+          job->message = "ERROR: jq_host not in the agent list!";
+          job_fail_event(scheduler, job);
           job = NULL;
-          break;
+          GSequenceIter* remove_me = iter;
+          iter = g_sequence_iter_next(iter);
+          g_sequence_remove(remove_me);
+          continue;
         }
-       } else {
-         //log_printf("ERROR %s.%d: jq_pk %d jq_host '%s' not in the agent list!\n",
-         //  __FILE__, __LINE__, job->id, job->required_host);
-         job->message = "ERROR: jq_host not in the agent list!";
-         job_fail_event(scheduler, job);
-         job = NULL;
-         break;
-       }
       }
       // the generic case, route by agent type for host affinity
       else if((host = get_host_for(scheduler, job->agent_type, 1)) == NULL)
       {
         job = NULL;
-        break;
+        iter = g_sequence_iter_next(iter);
+        continue;
       }
 
-      next_job(scheduler->job_queue);
+      /* Remove the job from the queue before dispatching */
+      GSequenceIter* remove_me = iter;
+      iter = g_sequence_iter_next(iter);
+      g_sequence_remove(remove_me);
+
       if(is_meta_special(
           g_tree_lookup(scheduler->meta_agents, job->agent_type), SAG_EXCLUSIVE))
       {
@@ -906,28 +930,45 @@ void scheduler_foss_config(scheduler_t* scheduler)
       continue;
     }
 
-    /* Parse: address agent_dir max [| tag1 tag2 ...]
-     * The pipe and tag list are optional; omitting them preserves the existing
-     * behaviour where the host accepts any agent type. */
-    char* pipe_pos = strchr(tmp, '|');
-    char** tags = NULL;
+    char* config_val = g_strdup(tmp);
+    char* pipe_pos = strchr(config_val, '|');
+    char* tag_buf[HOST_TAG_MAX];
     int n_tags = 0;
+    gboolean is_proxy = FALSE;
 
     if (pipe_pos != NULL) {
-      *pipe_pos = '\0';  /* terminate the base fields at the pipe */
-      pipe_pos++;        /* advance past the NUL we just wrote */
+      *pipe_pos = '\0';
+      pipe_pos++;
+
+      /* Check for a second pipe that separates flags (e.g. "| proxy") */
+      char* flags_pos = strchr(pipe_pos, '|');
+      if (flags_pos != NULL) {
+        *flags_pos = '\0';
+        flags_pos++;
+        char* fsaveptr = NULL;
+        char* ftok = strtok_r(flags_pos, " \t", &fsaveptr);
+        while (ftok != NULL) {
+          if (g_ascii_strcasecmp(ftok, "proxy") == 0)
+            is_proxy = TRUE;
+          ftok = strtok_r(NULL, " \t", &fsaveptr);
+        }
+      }
+
       char* saveptr = NULL;
       char* tok = strtok_r(pipe_pos, " \t", &saveptr);
-      while (tok != NULL && n_tags < 64) {
-        tags = g_renew(char*, tags, n_tags + 1);
-        tags[n_tags++] = tok;  /* points into tmp buffer; host_init will g_strdup */
+      while (tok != NULL && n_tags < HOST_TAG_MAX) {
+        if (tok[0] != '\0')
+          tag_buf[n_tags++] = tok;
         tok = strtok_r(NULL, " \t", &saveptr);
       }
+      if (tok != NULL && n_tags >= HOST_TAG_MAX)
+        WARNING("HOST %s: tag list truncated at %d tags\n", keys[i], HOST_TAG_MAX);
     }
 
-    sscanf(tmp, "%s %s %d", addbuf, dirbuf, &max);
-    host = host_init(keys[i], addbuf, dirbuf, max, tags, n_tags);
-    g_free(tags);  /* host_init g_strdup'd each tag string */
+    sscanf(config_val, "%s %s %d", addbuf, dirbuf, &max);
+    host = host_init(keys[i], addbuf, dirbuf, max,
+                     n_tags > 0 ? tag_buf : NULL, n_tags);
+    host->proxy_managed = is_proxy;
     host_insert(host, scheduler);
     if(TVERB_SCHED)
     {
@@ -936,9 +977,21 @@ void scheduler_foss_config(scheduler_t* scheduler)
       log_printf("   address = %s\n", addbuf);
       log_printf(" directory = %s\n", dirbuf);
       log_printf("       max = %d\n", max);
-      log_printf("    n_tags = %d\n", n_tags);
+      if (n_tags > 0) {
+        log_printf("      tags =");
+        for (int t = 0; t < n_tags; t++)
+          log_printf(" %s", tag_buf[t]);
+        log_printf("\n");
+      } else {
+        log_printf("      tags = [any]\n");
+      }
+      log_printf("     proxy = %s\n", is_proxy ? "yes" : "no");
     }
+    g_free(config_val);
   }
+
+  /* load the proxy configuration */
+  proxy_configure(scheduler->proxy, scheduler->sysconfig);
 
   if((tmp = fo_RepValidate(scheduler->sysconfig)) != NULL)
   {

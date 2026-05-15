@@ -16,6 +16,8 @@
 /* other library includes */
 #include <gio/gio.h>
 
+#define HOST_TAG_MAX 64  ///< Maximum number of agent-type tags per host
+
 /* ************************************************************************** */
 /* **** Data Types ********************************************************** */
 /* ************************************************************************** */
@@ -31,6 +33,7 @@ typedef struct {
   int running;      ///< The number of agents currently running on this host
   char** tags;      ///< NULL-terminated array of agent-type tags (e.g. "nomos", "monk"); NULL if universal
   int    n_tags;    ///< Number of tags (0 = host accepts any agent type)
+  gboolean proxy_managed; ///< TRUE if this host is behind the centralized proxy
 } host_t;
 
 /* ************************************************************************** */
@@ -49,6 +52,7 @@ void host_increase_load(host_t* host);
 void host_decrease_load(host_t* host);
 void host_print(host_t* host, GOutputStream* ostr);
 
+/** @deprecated Use get_host_for() which is agent-type aware. */
 host_t* get_host(GList** queue, uint8_t num);
 host_t* get_host_for(scheduler_t* scheduler, const char* agent_type, uint8_t num);
 void    print_host_load(GTree* host_list, GOutputStream* ostr);

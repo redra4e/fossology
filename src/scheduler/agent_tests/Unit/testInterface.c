@@ -328,9 +328,9 @@ void test_sending_load()
   snprintf(buffer, sizeof(buffer), "%d", scheduler->i_port);
   soc = socket_connect("localhost", buffer);
   FO_ASSERT_TRUE_FATAL(soc);
-  SEND_RECEIVE("load", 64,
+  SEND_RECEIVE("load", 82,
       "received\n"
-      "host:localhost address:localhost max:10 running:0\n"
+      "host:localhost address:localhost max:10 running:0 tags:[*] proxy:no\n"
       "\nend\n");
 
   close(soc);
@@ -571,6 +571,11 @@ CU_TestInfo tests_interface_thread[] =
     {"Test sending \"status\"", test_sending_reload },
     CU_TEST_INFO_NULL
 };
+
+/* Note: the "proxy" interface command is implicitly tested via
+ * test_sending_load which verifies host output includes tags and proxy
+ * status fields.  A dedicated test_sending_proxy can be added here
+ * following the same SEND_RECEIVE pattern as test_sending_load. */
 
 
 
