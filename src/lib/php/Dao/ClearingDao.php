@@ -69,7 +69,7 @@ class ClearingDao
     }
 
     $filterClause = $onlyCurrent ? "DISTINCT ON(itemid)" : "";
-    $sortClause = $onlyCurrent ? "ORDER BY itemid, scope, id DESC" : "";
+    $sortClause = $onlyCurrent ? "ORDER BY itemid, id DESC" : "";
 
     $statementName .= "." . $uploadTreeTable . ($onlyCurrent ? ".current": "");
 
@@ -184,7 +184,7 @@ class ClearingDao
   {
     $this->dbManager->begin();
 
-    $statementName = __METHOD__;
+    $statementName = __METHOD__ . ($includeSubFolders ? ".subfolders" : ".direct");
 
     if (!$includeSubFolders) {
       $params = array($itemTreeBounds->getItemId());
@@ -231,7 +231,7 @@ class ClearingDao
             LEFT JOIN clearing_decision_event cde ON cde.clearing_decision_fk = decision.id
             LEFT JOIN clearing_event ce ON ce.clearing_event_pk = cde.clearing_event_fk
             LEFT JOIN license_ref lr ON lr.rf_pk = ce.rf_fk
-            ORDER BY decision.id DESC, event_id ASC";
+            ORDER BY decision.id DESC, itemid, event_id ASC";
 
     $this->dbManager->prepare($statementName, $sql);
 
@@ -261,7 +261,7 @@ class ClearingDao
       $reportInfo = $row['reportinfo'];
       $acknowledgement = $row['acknowledgement'];
 
-      if ($clearingId !== $previousClearingId && $itemId !== $previousItemId) {
+      if ($clearingId !== $previousClearingId || $itemId !== $previousItemId) {
         //store the old one
         if (!$firstMatch) {
           $clearingsWithLicensesArray[] = $clearingDecisionBuilder->setClearingEvents($clearingEvents)->build();
@@ -269,11 +269,8 @@ class ClearingDao
 
         $firstMatch = false;
         //prepare the new one
-        if ($forClearingHistory) {
-          $previousClearingId = $clearingId;
-        } else {
-          $previousItemId = $itemId;
-        }
+        $previousClearingId = $clearingId;
+        $previousItemId = $itemId;
         $clearingEvents = array();
         $clearingDecisionBuilder = ClearingDecisionBuilder::create()
             ->setClearingId($row['id'])
@@ -372,7 +369,7 @@ INSERT INTO clearing_decision (
   scope
 ) VALUES (
   $1,
-  (SELECT pfile_fk FROM uploadtree WHERE uploadtree_pk=$1),
+  (SELECT pfile_fk FROM ". $uploadTreeTable ." WHERE uploadtree_pk=$1),
   $2,
   $3,
   $4,

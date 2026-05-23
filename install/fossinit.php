@@ -425,6 +425,9 @@ require_once ("$LIBEXECDIR/sanity_check.php");
 $checker = new SanityChecker($dbManager,$Verbose);
 $errors = $checker->check();
 
+require_once("$LIBEXECDIR/dbmigrate_licensedb_compatibility.php");
+LicenseDB_compatibility_migration();
+
 if($errors>0)
 {
   echo "ERROR: $errors sanity check".($errors>1?'s':'')." failed\n";
@@ -506,7 +509,6 @@ function insertInToLicenseRefTableUsingJson($tableName)
   ];
 
   $jsonData = json_decode(file_get_contents("$LIBEXECDIR/licenseRef.json"), true);
-  $statementName = __METHOD__.'.insertInTo'.$tableName;
   foreach($jsonData as $licenseArray) {
     foreach ($keysToReplicate as $duplicateKey => $originalKey) {
       if ($licenseArray['rf_spdx_compatible'] == 't') {
@@ -522,6 +524,7 @@ function insertInToLicenseRefTableUsingJson($tableName)
     $arrayKeys = array_keys($licenseArray);
     $arrayValues = array_values($licenseArray);
     $keys = strtr(implode(",", $arrayKeys), $keysToBeChanged);
+    $statementName = __METHOD__ . '.insertInTo' . $tableName . '.' . md5($tableName . $keys);
     $valuePlaceHolders = "$" . join(",$",range(1, count($arrayKeys)));
     $md5PlaceHolder = "$". (count($arrayKeys) + 1);
     $arrayValues[] = $licenseArray['rf_text'];
@@ -600,7 +603,8 @@ function initLicenseRefTable($Verbose)
       $sql = "UPDATE license_ref SET ";
       if (($rf_flag_check == 1 && $rf_flag == 1) &&
           ($rf_text_check != $rf_text && !empty($rf_text) &&
-          !(stristr($rf_text, 'License by Nomos')))) {
+          !(stristr($rf_text, 'License by Nomos')) &&
+          !(stristr($rf_text, 'License by OJO')))) {
         $params[] = $rf_text;
         $position = "$" . count($params);
         $sql .= "rf_text=$position,rf_md5=md5($position),rf_flag=1,";

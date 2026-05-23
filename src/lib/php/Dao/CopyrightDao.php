@@ -458,7 +458,7 @@ ORDER BY copyright_pk, UT.uploadtree_pk, content DESC";
 
     if (!empty($hash)) {
       $params[] = $hash;
-      $withHash = " (cp.hash = $4 OR ce.hash = $4) AND ";
+      $withHash = " (CASE WHEN (ce.hash IS NULL OR ce.hash = '') THEN cp.hash ELSE ce.hash END) = $4 AND ";
       $stmt .= ".hash";
     }
     // get latest agent id for agent
@@ -511,10 +511,16 @@ WHERE $withHash ( ut.lft BETWEEN $1 AND $2 ) $agentFilter AND ut.upload_fk = $3"
           $sqlEvent = "INSERT INTO $cpTableEvent (upload_fk, $cpTableEventFk, uploadtree_fk, is_enabled, scope) VALUES($1, $2, $3, 'f', $4)";
           $statement = "$stmt.delete";
         }
+      } else if ($action == "revertToOriginal") {
+        if (!$eventExists) {
+          continue;
+        }
+        $sqlEvent = "DELETE FROM $cpTableEvent WHERE upload_fk = $1 AND $cpTableEventFk = $2 AND uploadtree_fk = $3 AND is_enabled = true";
+        $statement = "$stmt.revertToOriginal";
       } else if ($action == "rollback" && $eventExists) {
-          $sqlEvent = "UPDATE $cpTableEvent SET scope = 1, is_enabled = true
+        $sqlEvent = "UPDATE $cpTableEvent SET scope = 1, is_enabled = true
           WHERE upload_fk = $1 AND $cpTableEventFk = $2 AND uploadtree_fk = $3";
-          $statement = "$stmt.rollback.up";
+        $statement = "$stmt.rollback.up";
       } else {
         $paramEvent[] = StringOperation::replaceUnicodeControlChar($content);
 
